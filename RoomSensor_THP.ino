@@ -29,11 +29,15 @@
 #define MQTT_SENS_TEMP_TOPIC "hm49/sens/temp/sht31-" UNIQUE_ID
 #define MQTT_SENS_HMDT_TOPIC "hm49/sens/hmdt/sht31-" UNIQUE_ID
 #define MQTT_SENS_PRSS_TOPIC "hm49/sens/prss/bmp280-" UNIQUE_ID
+#define MQTT_HWRD_BATT_TOPIC "hm49/hwrd/" DEVICE_NAME "/batt"
 
 #define uS_TO_S_FACTOR 1000000ULL  /* Conversion factor for micro seconds to seconds */
 #define DEEP_SLEEP_TIME  15*60     /* Time ESP32 will go to sleep (in seconds) */
 
 #define POWER_PIN 32
+
+#define ATMOSPHERIC_PRESSURE_OFFSET_PA   2356 // check METAR near your location (for Brno: https://en.allmetsat.com/metar-taf/poland.php?icao=LKTB)
+                                              // get METAR pressure, compare with BMP280 pressure and calculate offset in Pa
 
 
 
@@ -74,10 +78,14 @@ Adafruit_BMP280 bmp280; // I2C
 
 float temp_sht31, relh_sht31;
 float pres_bmp280;
+float batt_vltg;
 
 
 
 
+float readBatteryVoltage() {               // Lolin D32 has a 1/2 voltage divider -> if vbat = 4.2V then GPIO35 = vbat/2 = 2.1V
+   return analogRead(35)/4096.0 * 7.445;   // adc reading scaled to voltage with 7.445 factor
+}
 
 bool checkCfg() {
   uint32_t x = 0;
@@ -124,7 +132,7 @@ void deepSleep() {
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {   //callback includes topic and payload ( from which (topic) the payload is comming)
-  Serial.print("Message arrived");
+  Serial.println("Message arrived");
 }
 
 
@@ -141,18 +149,34 @@ void setup() {
   sht31.Begin();
   sht31.UpdateData();
   temp_sht31 = sht31.GetTemperature();
+  if ((temp_sht31 == 0.)||(temp_sht31 < -40)||(temp_sht31 > 70)) {
+    temp_sht31 = -100; // signalize error
+  }
   relh_sht31 = sht31.GetRelHumidity();
+  if ((relh_sht31 == 0.)||(relh_sht31 < 10)||(relh_sht31 > 90)) {
+    relh_sht31 = -100; // signalize error
+  }
 
-  bmp280.begin(BMP280_ADDRESS_ALT);
-  bmp280.setSampling(Adafruit_BMP280::MODE_FORCED,     /* Operating Mode. */  // handheld device low-power (e.g. Android) Ultra high resolution
-                     Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
-                     Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
-                     Adafruit_BMP280::FILTER_X4 ,      /* Filtering. */
-                     Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
-  pres_bmp280 = bmp280.readPressure();
+  if (bmp280.begin(BMP280_ADDRESS_ALT)) {
+    bmp280.setSampling(Adafruit_BMP280::MODE_FORCED,     /* Operating Mode. */  // handheld device low-power (e.g. Android) Ultra high resolution
+                       Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
+                       Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
+                       Adafruit_BMP280::FILTER_X4 ,      /* Filtering. */
+                       Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
+    pres_bmp280 = bmp280.readPressure() + ATMOSPHERIC_PRESSURE_OFFSET_PA;
+    if ((pres_bmp280 < 90000)||(pres_bmp280 > 110000)) pres_bmp280 = -100; // signalize error
+  } else {
+    pres_bmp280 = -100; // signalize error
+  }
 
   digitalWrite(POWER_PIN, LOW);
   pinMode(POWER_PIN, INPUT);   // reduces power consumption
+
+  batt_vltg = readBatteryVoltage();
+  if (batt_vltg < 3.0) {
+    Serial.println("Low battery voltage");
+    deepSleep();
+  }
 
   Serial.print("Temperature: ");
   Serial.print(temp_sht31);
@@ -161,16 +185,19 @@ void setup() {
   Serial.print("Humidity: ");
   Serial.print(relh_sht31);
   Serial.println("%");
-  Serial.print("Pressure = ");
+  Serial.print("Pressure: ");
   Serial.print(pres_bmp280);
-  Serial.println(" Pa");
+  Serial.println("Pa");
+  Serial.print("Battery: ");
+  Serial.print(batt_vltg);
+  Serial.println("V");
 
   // Wifi connection
   checkCfg();
 
   // Make sure Wifi settings in flash are off so it doesn't start automagically at next boot
   if (WiFi.getMode() != WIFI_OFF) {
-    Serial.println("Wifi wasn't off!");
+    Serial.println("Wifi wasn't off");
     WiFi.persistent(true);
     WiFi.mode(WIFI_OFF);
   }
@@ -188,7 +215,7 @@ void setup() {
   }
 
   if (!ok) {
-    Serial.printf("*** Wifi.begin failed, mode=%d\n", cfgbuf.mode);
+    Serial.println("Wifi.begin failed");
     cfgbuf.mode = 0;
     deepSleep();
   }
@@ -196,7 +223,7 @@ void setup() {
   uint16_t retries = 0;
   while (WiFi.status() != WL_CONNECTED) {
     retries++;
-    if (retries >= 1000) {
+    if (retries >= (5000/2)) { // wait max 5s = 2500 iterations with 2ms waiting time
       Serial.println("Cannot connect to WIFI");
       cfgbuf.mode = 0;
       deepSleep();
@@ -235,6 +262,8 @@ void setup() {
   mqtt.publish(MQTT_SENS_HMDT_TOPIC, msg, false);
   snprintf (msg, 10, "%04.2f", pres_bmp280);
   mqtt.publish(MQTT_SENS_PRSS_TOPIC, msg, false);
+  snprintf (msg, 10, "%04.2f", batt_vltg);
+  mqtt.publish(MQTT_HWRD_BATT_TOPIC, msg, false);
 
   writecfg();
   Serial.println("done");
